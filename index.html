@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <title>Survey123 + JS (Public) — robust polling</title>
+  <title>Survey123 + JS (Public) — boundary + county (robust polling)</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <style>
     html,body,#formDiv { height:100%; margin:0 }
@@ -12,18 +12,27 @@
 </head>
 <body>
   <div id="formDiv"></div>
-  <div class="note">Form: d431107105334b68ab800f53bbcb6167 | mode: polling</div>
+  <div class="note">Form: d431107105334b68ab800f53bbcb6167 | mode: polling | boundary + county</div>
+
   <script>
     // --- Config ---
-    const CLIENT_ID    = "X7mPIkcqsIiFgQfP";
-    const ITEM_ID      = "d431107105334b68ab800f53bbcb6167";
+    const CLIENT_ID = "X7mPIkcqsIiFgQfP";
+    const ITEM_ID   = "d431107105334b68ab800f53bbcb6167";
+
+    // 1) KEEP your original boundary layer (replace with your original one)
+    // If you still want the original "inside_boundary" behavior, this MUST be your old boundary layer:
     const BOUNDARY_URL = "https://services4.arcgis.com/9lICIlhSEuRFezSF/arcgis/rest/services/nsdin4515/FeatureServer/0";
 
+    // 2) NEW county layer (you provided)
+    const COUNTY_URL = "https://services3.arcgis.com/PWXNAH2YKmZY7lBq/arcgis/rest/services/TN_counties/FeatureServer/1";
+    const COUNTY_NAME_FIELD = "NAMELSAD"; // field in the county layer to return (e.g., "Hamilton County")
+
     // Match your XLS 'name' exactly:
-    const FIELD_LOCATION = "your_location";      // <-- geopoint name
+    const FIELD_LOCATION = "your_location";   // geopoint
     const FIELD_LON      = "longitude";
     const FIELD_LAT      = "latitude";
-    const FIELD_INSIDE   = "inside_boundary";
+    const FIELD_INSIDE   = "inside_boundary"; // keep old field
+    const FIELD_COUNTY   = "county_name";     // new field (you confirmed this exists)
 
     const webform = new Survey123WebForm({
       clientId:  CLIENT_ID,
@@ -31,7 +40,8 @@
       itemId:    ITEM_ID
     });
 
-    async function isPointInside(x, y) {
+    // ---------- OLD FUNCTION (kept): point-in-boundary YES/NO ----------
+    async function isPointInsideBoundary(x, y) {
       const params = new URLSearchParams({
         f: "json",
         where: "1=1",
@@ -42,22 +52,65 @@
         spatialRel: "esriSpatialRelWithin",
         returnGeometry: "false"
       });
+
       const resp = await fetch(`${BOUNDARY_URL}/query?${params.toString()}`);
       if (!resp.ok) throw new Error("Boundary query failed: " + resp.status);
+
       const json = await resp.json();
       return Array.isArray(json.features) && json.features.length > 0;
     }
 
-    // Write lon/lat + inside to the form
+    // ---------- NEW FUNCTION: county lookup ----------
+    async function getCountyNameForPoint(x, y) {
+      const params = new URLSearchParams({
+        f: "json",
+        where: "1=1",
+        outFields: COUNTY_NAME_FIELD,
+        returnGeometry: "false",
+        geometry: JSON.stringify({ x, y, spatialReference: { wkid: 4326 } }),
+        geometryType: "esriGeometryPoint",
+        inSR: "4326",
+        // Use Within to favor unique county; Intersects could return 2 if point is exactly on border
+        spatialRel: "esriSpatialRelWithin",
+        resultRecordCount: "1"
+      });
+
+      const resp = await fetch(`${COUNTY_URL}/query?${params.toString()}`);
+      if (!resp.ok) throw new Error("County query failed: " + resp.status);
+
+      const json = await resp.json();
+      const feats = json?.features;
+      if (!Array.isArray(feats) || feats.length === 0) return null;
+
+      const attrs = feats[0]?.attributes || {};
+      return attrs[COUNTY_NAME_FIELD] ?? null;
+    }
+
+    // ---------- Write values back to the form ----------
     async function writeFromLoc(pt) {
       if (!pt || pt.x == null || pt.y == null) return;
+
+      // keep original lon/lat auto-fill
       webform.setQuestionValue({ [FIELD_LON]: pt.x, [FIELD_LAT]: pt.y });
+
+      // run BOTH queries in parallel (faster)
       try {
-        const inside = await isPointInside(pt.x, pt.y);
+        const [inside, countyName] = await Promise.all([
+          isPointInsideBoundary(pt.x, pt.y),
+          getCountyNameForPoint(pt.x, pt.y)
+        ]);
+
+        // 1) Preserve original behavior: inside_boundary is derived from ORIGINAL boundary layer
         webform.setQuestionValue({ [FIELD_INSIDE]: inside ? "YES" : "NO" });
+
+        // 2) New behavior: write county name (or blank if not found)
+        webform.setQuestionValue({ [FIELD_COUNTY]: countyName ? String(countyName) : "" });
+
       } catch (err) {
         console.error(err);
+        // Keep a clear failure state
         webform.setQuestionValue({ [FIELD_INSIDE]: "UNKNOWN" });
+        webform.setQuestionValue({ [FIELD_COUNTY]: "" });
       }
     }
 
@@ -68,7 +121,7 @@
       }
     });
 
-    // 2) Robust fallback: poll the value periodically
+    // 2) Robust fallback: poll periodically
     let last = null;
     function different(a, b) {
       return !a || !b || a.x !== b.x || a.y !== b.y;
@@ -80,7 +133,10 @@
       try {
         const all = await webform.getQuestionValue();
         const loc = all?.[FIELD_LOCATION];
-        if (loc) { last = {x: loc.x, y: loc.y}; await writeFromLoc(loc); }
+        if (loc) {
+          last = { x: loc.x, y: loc.y };
+          await writeFromLoc(loc);
+        }
       } catch (_) { /* ignore */ }
 
       // start polling (every 400ms)
@@ -89,7 +145,7 @@
           const all = await webform.getQuestionValue();
           const loc = all?.[FIELD_LOCATION];
           if (loc && different(loc, last)) {
-            last = {x: loc.x, y: loc.y};
+            last = { x: loc.x, y: loc.y };
             await writeFromLoc(loc);
           }
         } catch (err) { /* ignore transient */ }
